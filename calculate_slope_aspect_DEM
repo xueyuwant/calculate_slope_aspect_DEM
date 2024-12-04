@@ -1,0 +1,194 @@
+import numpy as np
+from scipy import ndimage as nd
+from copy import deepcopy
+from osgeo import gdal
+gdal.UseExceptions() 
+
+
+def read_dem(demfile):
+    """
+    Reads a DEM file and returns the processed data, including the geotransform parameters and projection information.
+    
+    :param demfile: Path to the input DEM file
+    :return: Processed data including: data (DEM data), geo (geotransform parameters), proj (projection information)
+    """
+    # Open the DEM file
+    ds = gdal.Open(demfile) 
+    if ds is None:
+        raise FileNotFoundError(f"File {demfile} could not be opened. Please check the file path.")    
+    
+    # Get the number of columns (width) and rows (height) of the DEM
+    cols = ds.RasterXSize
+    rows = ds.RasterYSize
+    
+    # Get the geotransform parameters (e.g., pixel size, coordinate system offsets)
+    geo = ds.GetGeoTransform()
+    
+    # Get the projection information
+    proj = ds.GetProjection()
+    
+    # Read the DEM data into a NumPy array
+    dem_data = ds.ReadAsArray()
+    
+    # Get the NoData value and replace it with NaN
+    band = ds.GetRasterBand(1)
+    nodata = band.GetNoDataValue()
+    
+    if nodata is not None:
+        # Replace NoData values with NaN to avoid affecting calculations
+        dem_data = dem_data.astype(np.float64)
+        dem_data[dem_data == nodata] = np.nan
+    
+    # Return the processed data
+    return dem_data, geo, proj
+
+
+
+def calculate_pixel_size(geo, proj):
+    """
+    Calculate the actual size of each pixel in geographic space (in meters),
+    and convert if the unit is in degrees.
+    
+    Parameters:
+    geo - GeoTransform tuple, containing the geotransform information
+    proj - Projection information
+    
+    Returns:
+    xsize, ysize - The pixel size in the horizontal (x) and vertical (y) directions (in meters)
+    """
+    # geo[1] is the pixel size in the longitude direction (in degrees)
+    # geo[5] is the pixel size in the latitude direction (in degrees)
+
+    # If the pixel size is less than 0.2, assume it's in a geographic coordinate system (in degrees)
+    if abs(geo[1]) < 0.2:  # If the pixel size is less than 0.2 degrees, assume it's in a geographic coordinate system
+        lat = geo[3]  # Get the central latitude (reference latitude, in degrees)
+        
+        # Convert degrees to meters: 1 degree of longitude corresponds to 111320 * cos(latitude) meters
+        xsize = 111320 * np.cos(np.radians(lat)) * np.abs(geo[1])  # Pixel size in longitude direction (in meters)
+        ysize = 111320 * np.abs(geo[5])  # Pixel size in latitude direction (in meters)
+
+    else:  # Otherwise, assume the coordinate system is a projected coordinate system (in meters)
+        xsize = abs(geo[1])  # Pixel size in the horizontal direction (in meters)
+        ysize = abs(geo[5])  # Pixel size in the vertical direction (in meters)
+    
+    return xsize, ysize
+
+
+
+
+
+# Expand the boundary and fill with nearest value
+def add_border_with_nearest_value(data):
+    """
+    Expand the boundary of the DEM data and fill with the nearest value.
+    
+    Parameters:
+    data - The input DEM data (2D array)
+    
+    Returns:
+    Zbc - The expanded DEM data (2D array with boundary)
+    """
+    Zbc = np.pad(data, pad_width=1, mode='edge')
+    return Zbc
+
+
+
+
+
+# Calculate the slope
+def calculate_slope(data, geo, proj):
+    """
+    Calculate the slope of the DEM data.
+    
+    Parameters:
+    data - The DEM data (2D array)
+    geo - GeoTransform information (geographical parameters)
+    proj - Projection information
+    
+    Returns:
+    slope - Slope data (in degrees)
+    """
+    # Calculate actual pixel size (in meters)
+    xsize, ysize = calculate_pixel_size(geo, proj)
+    
+    # Expand the boundary of the DEM data
+    data = add_border_with_nearest_value(data)
+    
+    # Use a 3x3 convolution kernel to calculate the slope (Sobel operator)
+    # Calculate the slope in the x and y directions
+    dx = ((data[:-2, 2:] - data[:-2, :-2]) + 
+          2 * (data[1:-1, 2:] - data[1:-1, :-2]) + 
+          (data[2:, 2:] - data[2:, :-2])) / (8 * xsize)
+    
+    dy = ((data[2:, :-2] - data[:-2, :-2]) + 
+          2 * (data[2:, 1:-1] - data[:-2, 1:-1]) + 
+          (data[2:, 2:] - data[:-2, 2:])) / (8 * ysize)
+    
+    # Calculate the slope angle in degrees
+    slope = np.arctan(np.sqrt(dx**2 + dy**2)) * 180 / np.pi  # Slope angle (in degrees)
+    
+    # Optionally, you can convert the slope angle to slope percentage (optional, commented out)
+    # slope = np.abs(np.tan(slope)) * 100  # Convert to slope percentage
+    
+    # Calculate aspect (slope direction)
+    aspect = np.arctan2(dy, -dx) * 180 / np.pi
+
+    # Return the slope and aspect (optional depending on requirements)
+    return slope, aspect
+
+
+
+def save_raster(output_path_slope=None, output_path_aspect=None, data=None, geo=None, proj=None):
+    """
+    Save the processed data as GeoTIFF raster files.
+    
+    Parameters:
+    output_path_slope - The output path for the slope file (optional)
+    output_path_aspect - The output path for the aspect file (optional)
+    data - The DEM data (2D array)
+    geo - GeoTransform information
+    proj - Projection information
+    """
+    # Calculate slope and aspect
+    slope, aspect = calculate_slope(data, geo, proj)  # Calculate slope and aspect
+
+    # If the output slope path is specified, save the slope file
+    if output_path_slope:
+        driver = gdal.GetDriverByName('GTiff')  # Get the GeoTIFF driver
+        rows, cols = data.shape  # Get the number of rows and columns in the data
+        out_ds = driver.Create(output_path_slope, cols, rows, 1, gdal.GDT_Float32)  # Create the output raster file
+        out_ds.SetGeoTransform(geo)  # Set the geotransform information
+        out_ds.SetProjection(proj)  # Set the projection information
+        out_band = out_ds.GetRasterBand(1)  # Get the output raster band
+        out_band.WriteArray(slope)  # Write the slope data
+        out_band.SetNoDataValue(np.nan)  # Set NoData value as NaN
+        out_ds = None  # Close the file
+        print("Slope calculation is complete and saved!")
+
+    # If the output aspect path is specified, save the aspect file
+    if output_path_aspect:
+        driver = gdal.GetDriverByName('GTiff')  # Get the GeoTIFF driver
+        rows, cols = data.shape  # Get the number of rows and columns in the data
+        out_ds = driver.Create(output_path_aspect, cols, rows, 1, gdal.GDT_Float32)  # Create the output raster file
+        out_ds.SetGeoTransform(geo)  # Set the geotransform information
+        out_ds.SetProjection(proj)  # Set the projection information
+        out_band = out_ds.GetRasterBand(1)  # Get the output raster band
+        out_band.WriteArray(aspect)  # Write the aspect data
+        out_band.SetNoDataValue(np.nan)  # Set NoData value as NaN
+        out_ds = None  # Close the file
+        print("Aspect calculation is complete and saved!")
+
+
+
+if __name__ == '__main__':
+    
+    
+    demfile = r"F:/n00_e015_1arc_v3.tif" 
+    output_path_slope = r"F:/slope.tif"  
+    output_path_aspect = r"F:aspect.tif" 
+    data, geo, proj = read_dem(demfile)
+    save_raster(output_path_slope,
+            output_path_aspect, 
+            data=data, 
+            geo=geo, 
+            proj=proj)
